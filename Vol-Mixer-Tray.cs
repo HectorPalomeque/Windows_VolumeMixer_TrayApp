@@ -2,111 +2,105 @@ using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
-using System.Reflection;                 // embedded resources
-using System.Runtime.InteropServices;    // DPI + Win32 helpers
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
-using Microsoft.Win32;                   // theme from registry
-// Disambiguate Timer
+using Microsoft.Win32;
 using Timer = System.Windows.Forms.Timer;
 
 namespace VolMixerTray
 {
     static class Program
     {
-        [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
+        // Modern DPI Awareness (Per-Monitor V2) with fallback
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern int SetProcessDpiAwarenessContext(int dpiFlag);
+        const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
+
+        [DllImport("user32.dll")]
+        static extern bool SetProcessDPIAware();
+
+        static void EnableDPI()
+        {
+            try { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); return; } catch { }
+            try { SetProcessDPIAware(); } catch { }
+        }
 
         [STAThread]
         static void Main(string[] args)
         {
-            try { SetProcessDPIAware(); } catch { /* best-effort */ }
+            EnableDPI();
 
             try
             {
-                // Defaults (can be overridden via args)
-                int timeoutMs        = 30000; // watch time
-                int pollMs           = 250;   // timer interval
-                int distancePx       = 300;   // auto-close distance
-                int pad              = 8;     // edge padding
-                bool useMouseMonitor = true;  // choose monitor under cursor
+                int timeoutMs = 30000;
+                int pollMs = 250;
+                int distancePx = 300;
+                int pad = 8;
+                bool useMouseMonitor = true;
 
                 foreach (string a in args)
                 {
-                    if (a.StartsWith("--timeoutMs=", StringComparison.OrdinalIgnoreCase))
-                        int.TryParse(a.Substring(12), out timeoutMs);
-                    else if (a.StartsWith("--distancePx=", StringComparison.OrdinalIgnoreCase))
-                        int.TryParse(a.Substring(13), out distancePx);
-                    else if (a.StartsWith("--pad=", StringComparison.OrdinalIgnoreCase))
-                        int.TryParse(a.Substring(6), out pad);
-                    else if (a.StartsWith("--monitor=", StringComparison.OrdinalIgnoreCase))
-                        useMouseMonitor = !a.EndsWith("primary", StringComparison.OrdinalIgnoreCase);
+                    if (a.StartsWith("--timeoutMs=", StringComparison.OrdinalIgnoreCase)) int.TryParse(a.Substring(12), out timeoutMs);
+                    else if (a.StartsWith("--distancePx=", StringComparison.OrdinalIgnoreCase)) int.TryParse(a.Substring(13), out distancePx);
+                    else if (a.StartsWith("--pad=", StringComparison.OrdinalIgnoreCase)) int.TryParse(a.Substring(6), out pad);
+                    else if (a.StartsWith("--monitor=", StringComparison.OrdinalIgnoreCase)) useMouseMonitor = !a.EndsWith("primary", StringComparison.OrdinalIgnoreCase);
                 }
 
                 bool first;
-
-                // Per-user/session mutex (no Global\ → no special privileges needed)
                 using (var m = new Mutex(true, @"VolMixerTray_Mutex", out first))
                 {
                     if (!first) return;
 
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-
-                    // Run an ApplicationContext, NOT a Form -> no visible window
                     Application.Run(new TrayContext(timeoutMs, pollMs, distancePx, pad, useMouseMonitor));
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("VolMixerTray failed to start:\r\n\r\n" + ex,
-                    "VolMixerTray Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show("VolMixerTray failed to start:\r\n\r\n" + ex, "VolMixerTray Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
     }
 
-    // Tray-only app: no Form, no Alt+Tab entry
     sealed class TrayContext : ApplicationContext
     {
-        // Embedded resource logical names (provided at compile time with /resource:)
-        const string LightIconRes = "VolMixerTray.Icons.Light.ico"; // volmixer_black.ico
-        const string DarkIconRes  = "VolMixerTray.Icons.Dark.ico";  // volmixer.ico
+        const string LightIconRes = "VolMixerTray.Icons.Light.ico";
+        const string DarkIconRes = "VolMixerTray.Icons.Dark.ico";
+        const string AppId = "VolumeMixerTray";
 
         enum IconThemeMode { Auto = 0, Light = 1, Dark = 2 }
-        enum AppLanguage   { English = 0, Spanish = 1 }
+        enum AppLanguage { English = 0, Spanish = 1 }
 
-        const string RegLangKeyPath  = @"Software\VolMixerTray";
-        const string RegLangValue    = "Language"; // "en" / "es"
+        const string RegLangKeyPath = @"Software\VolMixerTray";
+        const string RegLangValue = "Language";
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        readonly Timer timer;            // watcher
-        readonly Timer themeTimer;       // theme polling when Auto
+        readonly Timer timer;             // watch distance
+        readonly Timer windowFindTimer;   // non-blocking window search
         readonly int totalWatchMs, pollMs, distancePx, pad;
         readonly bool useMouseMonitor;
 
-        // State
-        Point anchor;              // where we want SndVol (physical px)
-        Point startMouse;          // mouse at launch (physical px)
+        Point anchor;
+        Point startMouse;
         DateTime startedUtc;
         DateTime graceUntilUtc;
-        Rectangle activeBounds;    // monitor bounds
-        Rectangle safeZoneBRQ;     // bottom-right quarter
+        Rectangle activeBounds;
+        Rectangle safeZoneBRQ;
+        
         Process sndVol;
+        IntPtr sndVolHandle = IntPtr.Zero;
+        int findTicks = 0;
 
-        // Icons
         Icon exeFallbackIcon, lightIcon, darkIcon;
-
-        // Theme radio
         IconThemeMode iconMode = IconThemeMode.Auto;
-        int lastObservedAppsThemeLight = -1;
-
-        // Menu items (so we can localize them)
-        ToolStripMenuItem miOpenMixer;
-        ToolStripMenuItem miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
-        ToolStripMenuItem miLanguageRoot, miLangEn, miLangEs;
-        ToolStripMenuItem miExit;
-
         AppLanguage currentLanguage;
+
+        ToolStripMenuItem miOpenMixer, miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
+        ToolStripMenuItem miLanguageRoot, miLangEn, miLangEs, miStartup, miExit;
 
         // ===== Win32 helpers =====
         [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
@@ -118,33 +112,66 @@ namespace VolMixerTray
         [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-        [DllImport("user32.dll")] static extern bool SetWindowPos(
-            IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 
         static readonly IntPtr HWND_TOP = IntPtr.Zero;
         const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
+        const uint WM_CLOSE = 0x0010;
 
-        static IntPtr FindTopLevelWindowByPid(int pid, int maxTries, int sleepMs)
+        // Theme Event Watcher
+        sealed class SystemEventWatcher : NativeWindow, IDisposable
         {
-            for (int t = 0; t < maxTries; t++)
-            {
-                IntPtr found = IntPtr.Zero;
-                EnumWindows(delegate(IntPtr h, IntPtr l)
-                {
-                    uint procId;
-                    GetWindowThreadProcessId(h, out procId);
-                    if (procId == (uint)pid && IsWindowVisible(h))
-                    {
-                        found = h;
-                        return false; // stop enum
-                    }
-                    return true; // continue
-                }, IntPtr.Zero);
+            private const int WM_SETTINGCHANGE = 0x001A;
+            private readonly Action _onThemeChange;
+            private readonly Action _onTaskbarCreated;
+            private readonly uint _wmTaskbarCreated;
 
-                if (found != IntPtr.Zero) return found;
-                System.Threading.Thread.Sleep(sleepMs);
+            [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            private static extern uint RegisterWindowMessage(string lpString);
+
+            public SystemEventWatcher(Action onThemeChange, Action onTaskbarCreated)
+            {
+                CreateHandle(new CreateParams());
+                _onThemeChange = onThemeChange;
+                _onTaskbarCreated = onTaskbarCreated;
+                _wmTaskbarCreated = RegisterWindowMessage("TaskbarCreated");
             }
-            return IntPtr.Zero;
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == WM_SETTINGCHANGE && m.LParam != IntPtr.Zero)
+                {
+                    string area = Marshal.PtrToStringUni(m.LParam);
+                    if (area == "ImmersiveColorSet" && _onThemeChange != null) _onThemeChange();
+                }
+                else if (m.Msg == _wmTaskbarCreated && _wmTaskbarCreated != 0)
+                {
+                    if (_onTaskbarCreated != null) _onTaskbarCreated();
+                }
+                base.WndProc(ref m);
+            }
+
+            public void Dispose() { if (Handle != IntPtr.Zero) DestroyHandle(); }
+        }
+
+        SystemEventWatcher themeWatcher;
+
+        static IntPtr FindTopLevelWindowByPid(int pid)
+        {
+            IntPtr found = IntPtr.Zero;
+            EnumWindows(delegate (IntPtr h, IntPtr l)
+            {
+                uint procId;
+                GetWindowThreadProcessId(h, out procId);
+                if (procId == (uint)pid && IsWindowVisible(h))
+                {
+                    found = h;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return found;
         }
 
         static void MoveWindowBottomRight(IntPtr hWnd, Rectangle screenBounds, Point anchorBR)
@@ -154,15 +181,8 @@ namespace VolMixerTray
             int w = r.Right - r.Left;
             int h = r.Bottom - r.Top;
 
-            // place so window's bottom-right == anchorBR
-            int x = anchorBR.X - w;
-            int y = anchorBR.Y - h;
-
-            // clamp to monitor bounds
-            if (x < screenBounds.Left) x = screenBounds.Left;
-            if (y < screenBounds.Top)  y = screenBounds.Top;
-            if (x + w > screenBounds.Right)  x = screenBounds.Right - w;
-            if (y + h > screenBounds.Bottom) y = screenBounds.Bottom - h;
+            int x = Math.Max(screenBounds.Left, Math.Min(anchorBR.X - w, screenBounds.Right - w));
+            int y = Math.Max(screenBounds.Top, Math.Min(anchorBR.Y - h, screenBounds.Bottom - h));
 
             SetWindowPos(hWnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -173,74 +193,91 @@ namespace VolMixerTray
             bool wow64 = Environment.Is64BitOperatingSystem && !Environment.Is64BitProcess;
             return System.IO.Path.Combine(windir, wow64 ? @"Sysnative\SndVol.exe" : @"System32\SndVol.exe");
         }
-        // ==========================
 
         public TrayContext(int totalWatchMs, int pollMs, int distancePx, int pad, bool useMouseMonitor)
         {
-            this.totalWatchMs     = totalWatchMs;
-            this.pollMs           = pollMs;
-            this.distancePx       = distancePx;
-            this.pad              = pad;
-            this.useMouseMonitor  = useMouseMonitor;
+            this.totalWatchMs = totalWatchMs;
+            this.pollMs = pollMs;
+            this.distancePx = distancePx;
+            this.pad = pad;
+            this.useMouseMonitor = useMouseMonitor;
 
             try { exeFallbackIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch { exeFallbackIcon = SystemIcons.Application; }
 
             lightIcon = LoadEmbeddedIcon(LightIconRes);
-            darkIcon  = LoadEmbeddedIcon(DarkIconRes);
+            darkIcon = LoadEmbeddedIcon(DarkIconRes);
 
-            // Context menu
             menu = new ContextMenuStrip();
-
-            miOpenMixer = new ToolStripMenuItem("Open Volume Mixer", null, new EventHandler(OpenClick));
+            miOpenMixer = new ToolStripMenuItem("Open Volume Mixer", null, OpenClick);
 
             miThemeRoot = new ToolStripMenuItem("Tray Icon Theme");
-            miThemeAuto  = new ToolStripMenuItem("Follow Windows theme (Auto)", null, delegate { SetIconMode(IconThemeMode.Auto); });
-            miThemeLight = new ToolStripMenuItem("Use Dark Icon",               null, delegate { SetIconMode(IconThemeMode.Light); });
-            miThemeDark  = new ToolStripMenuItem("Use Light Icon",              null, delegate { SetIconMode(IconThemeMode.Dark); });
-            miThemeRoot.DropDownItems.Add(miThemeAuto);
-            miThemeRoot.DropDownItems.Add(miThemeLight);
-            miThemeRoot.DropDownItems.Add(miThemeDark);
+            miThemeAuto = new ToolStripMenuItem("Follow Windows theme (Auto)", null, delegate { SetIconMode(IconThemeMode.Auto); });
+            miThemeLight = new ToolStripMenuItem("Use Dark Icon", null, delegate { SetIconMode(IconThemeMode.Light); });
+            miThemeDark = new ToolStripMenuItem("Use Light Icon", null, delegate { SetIconMode(IconThemeMode.Dark); });
+            miThemeRoot.DropDownItems.AddRange(new[] { miThemeAuto, miThemeLight, miThemeDark });
 
-            // Language submenu
             miLanguageRoot = new ToolStripMenuItem("Language");
             miLangEn = new ToolStripMenuItem("English", null, delegate { SetLanguage(AppLanguage.English); });
             miLangEs = new ToolStripMenuItem("Spanish", null, delegate { SetLanguage(AppLanguage.Spanish); });
-            miLanguageRoot.DropDownItems.Add(miLangEn);
-            miLanguageRoot.DropDownItems.Add(miLangEs);
+            miLanguageRoot.DropDownItems.AddRange(new[] { miLangEn, miLangEs });
 
-            miExit = new ToolStripMenuItem("Exit", null, new EventHandler(ExitClick));
+            miStartup = new ToolStripMenuItem("Run at Startup");
+            miStartup.Click += delegate { ToggleRunAtStartup(); };
+            menu.Opening += delegate { miStartup.Checked = IsRunAtStartupEnabled(); };
 
-            menu.Items.Add(miOpenMixer);
-            menu.Items.Add(miThemeRoot);
-            menu.Items.Add(miLanguageRoot);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(miExit);
+            miExit = new ToolStripMenuItem("Exit", null, ExitClick);
 
-            tray = new NotifyIcon();
-            tray.Icon = exeFallbackIcon;
-            tray.Visible = true;
-            tray.ContextMenuStrip = menu;
-            tray.MouseClick += new MouseEventHandler(TrayClick);
+            menu.Items.AddRange(new ToolStripItem[] { miOpenMixer, miThemeRoot, miLanguageRoot, new ToolStripSeparator(), miStartup, new ToolStripSeparator(), miExit });
 
-            // Timers must be created before SetIconMode / UpdateThemeTimer
-            timer = new Timer();
-            timer.Interval = this.pollMs;
-            timer.Tick += new EventHandler(TimerTick);
+            tray = new NotifyIcon { Icon = exeFallbackIcon, Visible = true, ContextMenuStrip = menu };
+            tray.MouseClick += TrayClick;
 
-            themeTimer = new Timer();
-            themeTimer.Interval = 1500;
-            themeTimer.Tick += new EventHandler(ThemeTimerTick);
+            timer = new Timer { Interval = this.pollMs };
+            timer.Tick += TimerTick;
 
-            // Initial theme + language
+            windowFindTimer = new Timer { Interval = 50 };
+            windowFindTimer.Tick += WindowFindTimerTick;
+
+            themeWatcher = new SystemEventWatcher(
+                () => { if (iconMode == IconThemeMode.Auto) ApplyTrayIcon(); },
+                () => { try { if (tray != null) { tray.Visible = false; tray.Visible = true; ApplyTrayIcon(); } } catch { } }
+            );
+
             SetIconMode(IconThemeMode.Auto);
             currentLanguage = DetectInitialLanguage();
-            ApplyLanguage();         // set texts according to currentLanguage
-
-            tray.ShowBalloonTip(1500);
+            ApplyLanguage();
         }
 
-        // ===== Language helpers =====
+        bool IsRunAtStartupEnabled()
+        {
+            try 
+            { 
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false)) 
+                {
+                    if (k != null) return k.GetValue(AppId) != null; 
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        void ToggleRunAtStartup()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (k != null)
+                    {
+                        if (IsRunAtStartupEnabled()) k.DeleteValue(AppId, false);
+                        else k.SetValue(AppId, Application.ExecutablePath);
+                    }
+                }
+            }
+            catch { }
+        }
+
         static AppLanguage DetectInitialLanguage()
         {
             try
@@ -249,241 +286,126 @@ namespace VolMixerTray
                 {
                     if (k != null)
                     {
-                        object raw = k.GetValue(RegLangValue);
-                        string v = raw as string;
-                        if (!string.IsNullOrEmpty(v))
-                        {
-                            if (string.Equals(v, "es", StringComparison.OrdinalIgnoreCase))
-                                return AppLanguage.Spanish;
-                            if (string.Equals(v, "en", StringComparison.OrdinalIgnoreCase))
-                                return AppLanguage.English;
-                        }
+                        string v = k.GetValue(RegLangValue) as string;
+                        if (!string.IsNullOrEmpty(v)) return string.Equals(v, "es", StringComparison.OrdinalIgnoreCase) ? AppLanguage.Spanish : AppLanguage.English;
                     }
                 }
             }
             catch { }
-
-            // Fallback to OS UI language
-            try
-            {
-                CultureInfo ui = CultureInfo.InstalledUICulture; // or CurrentUICulture
-                string two = ui.TwoLetterISOLanguageName;
-                if (string.Equals(two, "es", StringComparison.OrdinalIgnoreCase))
-                    return AppLanguage.Spanish;
-            }
-            catch { }
-
+            try { if (string.Equals(CultureInfo.InstalledUICulture.TwoLetterISOLanguageName, "es", StringComparison.OrdinalIgnoreCase)) return AppLanguage.Spanish; } catch { }
             return AppLanguage.English;
-        }
-
-        static void SaveLanguage(AppLanguage lang)
-        {
-            try
-            {
-                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegLangKeyPath))
-                {
-                    if (k != null)
-                    {
-                        string code = (lang == AppLanguage.Spanish) ? "es" : "en";
-                        k.SetValue(RegLangValue, code, RegistryValueKind.String);
-                    }
-                }
-            }
-            catch { }
         }
 
         void SetLanguage(AppLanguage lang)
         {
             currentLanguage = lang;
-            SaveLanguage(lang);
+            try 
+            { 
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegLangKeyPath)) 
+                {
+                    if (k != null) k.SetValue(RegLangValue, lang == AppLanguage.Spanish ? "es" : "en", RegistryValueKind.String); 
+                }
+            } 
+            catch { }
             ApplyLanguage();
         }
 
         void ApplyLanguage()
         {
             bool es = currentLanguage == AppLanguage.Spanish;
+            if (miOpenMixer != null) miOpenMixer.Text = es ? "Abrir mezclador de volumen" : "Open Volume Mixer";
+            if (miThemeRoot != null) miThemeRoot.Text = es ? "Tema del icono" : "Tray Icon Theme";
+            if (miThemeAuto != null) miThemeAuto.Text = es ? "Auto (Seguir sistema)" : "Follow Windows theme (Auto)";
+            if (miThemeLight != null) miThemeLight.Text = es ? "Usar icono oscuro" : "Use Dark Icon";
+            if (miThemeDark != null) miThemeDark.Text = es ? "Usar icono claro" : "Use Light Icon";
+            if (miLanguageRoot != null) miLanguageRoot.Text = es ? "Idioma" : "Language";
+            if (miLangEn != null) miLangEn.Text = es ? "Inglés" : "English";
+            if (miLangEs != null) miLangEs.Text = es ? "Español" : "Spanish";
+            if (miStartup != null) miStartup.Text = es ? "Ejecutar al iniciar Windows" : "Run at Startup";
+            if (miExit != null) miExit.Text = es ? "Salir (Cerrar App)" : "Exit (Close App)";
 
-            // Menu texts
-            if (miOpenMixer != null)
-                miOpenMixer.Text = es ? "Abrir mezclador de volumen" : "Open Volume Mixer";
-
-            if (miThemeRoot != null)
-                miThemeRoot.Text = es ? "Tema del icono de bandeja" : "Tray Icon Theme";
-            if (miThemeAuto != null)
-                miThemeAuto.Text = es ? "Seguir tema de Windows (Auto)" : "Follow Windows theme (Auto)";
-            if (miThemeLight != null)
-                miThemeLight.Text = es ? "Usar icono oscuro" : "Use Dark Icon";
-            if (miThemeDark != null)
-                miThemeDark.Text = es ? "Usar icono claro" : "Use Light Icon";
-
-            if (miLanguageRoot != null)
-                miLanguageRoot.Text = es ? "Idioma" : "Language";
-            if (miLangEn != null)
-                miLangEn.Text = es ? "Inglés" : "English";
-            if (miLangEs != null)
-                miLangEs.Text = es ? "Español" : "Spanish";
-
-            if (miExit != null)
-                miExit.Text = es ? "Salir (Cerrar App)" : "Exit (Close App)";
-
-            // Check marks for language
             if (miLangEn != null) miLangEn.Checked = (currentLanguage == AppLanguage.English);
             if (miLangEs != null) miLangEs.Checked = (currentLanguage == AppLanguage.Spanish);
 
-            // Tray tooltip + balloon
-            if (tray != null)
-            {
-                tray.Text = es ? "Mezclador de volumen" : "Volume Mixer";
-                tray.BalloonTipTitle = es ? "Mezclador de volumen" : "Volume Mixer";
-                tray.BalloonTipText  = es
-                    ? "La bandeja está activa. Haz clic izquierdo para mostrar el mezclador clásico."
-                    : "Tray is running. Left-click to toggle the classic mixer.";
-            }
+            if (tray != null) tray.Text = es ? "Mezclador de volumen" : "Volume Mixer";
         }
-
-        // ==========================
 
         static Icon LoadEmbeddedIcon(string resourceName)
         {
-            try
-            {
-                Assembly asm = Assembly.GetExecutingAssembly();
-                using (System.IO.Stream s = asm.GetManifestResourceStream(resourceName))
-                {
-                    if (s != null) return new Icon(s);
-                }
-            }
-            catch { }
+            try { using (System.IO.Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)) { if (s != null) return new Icon(s); } } catch { }
             return null;
         }
 
         void SetIconMode(IconThemeMode mode)
         {
             iconMode = mode;
-            if (miThemeAuto  != null) miThemeAuto.Checked  = (mode == IconThemeMode.Auto);
+            if (miThemeAuto != null) miThemeAuto.Checked = (mode == IconThemeMode.Auto);
             if (miThemeLight != null) miThemeLight.Checked = (mode == IconThemeMode.Light);
-            if (miThemeDark  != null) miThemeDark.Checked  = (mode == IconThemeMode.Dark);
+            if (miThemeDark != null) miThemeDark.Checked = (mode == IconThemeMode.Dark);
             ApplyTrayIcon();
-            UpdateThemeTimer();
         }
 
         void ApplyTrayIcon()
         {
             Icon target = exeFallbackIcon;
-            if (iconMode == IconThemeMode.Light)
-            {
-                if (lightIcon != null) target = lightIcon;
-            }
-            else if (iconMode == IconThemeMode.Dark)
-            {
-                if (darkIcon != null) target = darkIcon;
-            }
-            else
+            if (iconMode == IconThemeMode.Light && lightIcon != null) target = lightIcon;
+            else if (iconMode == IconThemeMode.Dark && darkIcon != null) target = darkIcon;
+            else if (iconMode == IconThemeMode.Auto)
             {
                 int theme = ReadAppsUseLightTheme();
-                if (theme == 1) { if (lightIcon != null) target = lightIcon; }
-                else            { if (darkIcon  != null) target = darkIcon;  } // default to dark icon
+                target = theme == 1 ? (lightIcon != null ? lightIcon : target) : (darkIcon != null ? darkIcon : target);
             }
             try { tray.Icon = target; } catch { }
-        }
-
-        void UpdateThemeTimer()
-        {
-            if (themeTimer == null) return; // safety guard
-
-            if (iconMode == IconThemeMode.Auto)
-            {
-                lastObservedAppsThemeLight = ReadAppsUseLightTheme();
-                themeTimer.Start();
-            }
-            else
-            {
-                themeTimer.Stop();
-            }
-        }
-
-        void ThemeTimerTick(object sender, EventArgs e)
-        {
-            if (iconMode != IconThemeMode.Auto) return;
-            int cur = ReadAppsUseLightTheme();
-            if (cur != lastObservedAppsThemeLight)
-            {
-                lastObservedAppsThemeLight = cur;
-                ApplyTrayIcon();
-            }
         }
 
         static int ReadAppsUseLightTheme()
         {
             try
             {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
-                    @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
                 {
                     if (k != null)
                     {
                         object v = k.GetValue("AppsUseLightTheme");
-                        if (v is int)
-                        {
-                            int iv = (int)v;
-                            if (iv == 0) return 0; // Dark
-                            if (iv == 1) return 1; // Light
-                        }
+                        if (v is int) return (int)v;
                     }
                 }
             }
             catch { }
-            return -1;
+            return 0;
         }
 
-        // === UI events ===
-        void TrayClick(object sender, MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left) Toggle();
-        }
+        void TrayClick(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Toggle(); }
+        void OpenClick(object s, EventArgs e) { OpenVolumeMixerSettings(); }
+        void ExitClick(object s, EventArgs e) { try { tray.Visible = false; } catch { } ExitThread(); }
 
-        void OpenClick(object s, EventArgs e)
-        {
-            OpenVolumeMixerSettings();
-        }
-
-        void ExitClick(object s, EventArgs e)
-        {
-            try { tray.Visible = false; } catch { }
-            ExitThread();   // closes the message loop and ends the app
-        }
-
-        // Settings > Sound > Volume Mixer
         static void OpenVolumeMixerSettings()
         {
-            try
-            {
-                Process.Start(new ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true });
-                return;
-            }
-            catch { }
+            try { Process.Start(new ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true }); return; } catch { }
+            try { Process.Start(new ProcessStartInfo("ms-settings:sound") { UseShellExecute = true }); } catch { }
+        }
 
-            foreach (string uri in new[] { "ms-settings:sound", "ms-settings:system-sound" })
+        void CloseSndVolGracefully()
+        {
+            // Try graceful close via PostMessage first to save user settings
+            if (sndVolHandle != IntPtr.Zero)
             {
-                try
-                {
-                    Process.Start(new ProcessStartInfo(uri) { UseShellExecute = true });
-                    return;
-                }
-                catch { }
+                PostMessage(sndVolHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                sndVolHandle = IntPtr.Zero;
+            }
+            
+            // Backup killer for any orphaned process
+            if (sndVol != null && !sndVol.HasExited)
+            {
+                try { sndVol.CloseMainWindow(); } catch { }
             }
         }
 
-        // === Classic SndVol toggle (robust) ===
         void Toggle()
         {
             try
             {
-                // Close existing mixers
-                foreach (Process proc in Process.GetProcessesByName("SndVol"))
-                {
-                    try { proc.Kill(); } catch { }
-                }
+                CloseSndVolGracefully();
 
                 if (sndVol != null && !sndVol.HasExited)
                 {
@@ -492,80 +414,70 @@ namespace VolMixerTray
                     return;
                 }
 
-                // Determine target screen using PHYSICAL cursor position
-                POINT pnt; if (!GetCursorPos(out pnt)) pnt = new POINT { X = 0, Y = 0 };
+                POINT pnt;
+                GetCursorPos(out pnt);
                 Point physMouse = new Point(pnt.X, pnt.Y);
-
                 Screen scr = useMouseMonitor ? Screen.FromPoint(physMouse) : Screen.PrimaryScreen;
                 activeBounds = scr.Bounds;
-                safeZoneBRQ = new Rectangle(
-                    activeBounds.Left + activeBounds.Width / 2,
-                    activeBounds.Top  + activeBounds.Height / 2,
-                    activeBounds.Width / 2,
-                    activeBounds.Height / 2
-                );
+                safeZoneBRQ = new Rectangle(activeBounds.Left + activeBounds.Width / 2, activeBounds.Top + activeBounds.Height / 2, activeBounds.Width / 2, activeBounds.Height / 2);
 
-                // Bottom-right anchor inside WorkingArea
                 anchor = ComputeAnchor(scr, pad);
-
-                // Pack (y<<16)|x for -t
                 int packed = ((anchor.Y & 0xFFFF) << 16) | (anchor.X & 0xFFFF);
 
-                var si = new ProcessStartInfo
+                if (sndVol != null)
+                {
+                    try { sndVol.Dispose(); } catch { }
+                    sndVol = null;
+                }
+
+                sndVol = Process.Start(new ProcessStartInfo
                 {
                     FileName = GetSndVolPath(),
                     Arguments = "-t " + packed,
                     UseShellExecute = false,
-                    CreateNoWindow  = true,
-                    WindowStyle     = ProcessWindowStyle.Hidden
-                };
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
 
                 startMouse = physMouse;
                 graceUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
-
-                sndVol = Process.Start(si);
                 startedUtc = DateTime.UtcNow;
-                timer.Start();
 
-                // If -t is ignored on this device, force-move the window to bottom-right
-                IntPtr h = FindTopLevelWindowByPid(sndVol.Id, maxTries: 60, sleepMs: 50); // wait up to ~3s
-                if (h != IntPtr.Zero) MoveWindowBottomRight(h, activeBounds, anchor);
+                findTicks = 0;
+                windowFindTimer.Start();
+                timer.Start();
             }
             catch (Exception ex)
             {
-                try
-                {
-                    string title = (currentLanguage == AppLanguage.Spanish)
-                        ? "Mezclador de volumen"
-                        : "Volume Mixer";
+                tray.ShowBalloonTip(2500, currentLanguage == AppLanguage.Spanish ? "Mezclador de volumen" : "Volume Mixer", ex.Message, ToolTipIcon.Error);
+            }
+        }
 
-                    string prefix = (currentLanguage == AppLanguage.Spanish)
-                        ? "No se pudo abrir SndVol: "
-                        : "Failed to open SndVol: ";
+        void WindowFindTimerTick(object sender, EventArgs e)
+        {
+            if (sndVol == null || sndVol.HasExited) { windowFindTimer.Stop(); return; }
 
-                    tray.ShowBalloonTip(
-                        2500,
-                        title,
-                        prefix + ex.Message,
-                        ToolTipIcon.Error);
-                }
-                catch { }
+            findTicks++;
+            IntPtr h = FindTopLevelWindowByPid(sndVol.Id);
+            if (h != IntPtr.Zero)
+            {
+                sndVolHandle = h;
+                MoveWindowBottomRight(h, activeBounds, anchor);
+                windowFindTimer.Stop();
+            }
+            else if (findTicks > 60) // Stop after ~3 seconds
+            {
+                windowFindTimer.Stop();
             }
         }
 
         static Point ComputeAnchor(Screen scr, int pad)
         {
             Rectangle wa = scr.WorkingArea;
-            Rectangle b  = scr.Bounds;
-
-            bool bottom = wa.Bottom < b.Bottom;
-            bool top    = wa.Top    > b.Top;
-            bool right  = wa.Right  < b.Right;
-            bool left   = wa.Left   > b.Left;
-
-            if (bottom || right) return new Point(wa.Right - pad, wa.Bottom - pad);
-            if (top)             return new Point(wa.Right - pad, wa.Top + pad);
-            if (left)            return new Point(wa.Left + pad,  wa.Bottom - pad);
+            Rectangle b = scr.Bounds;
+            if (wa.Bottom < b.Bottom || wa.Right < b.Right) return new Point(wa.Right - pad, wa.Bottom - pad);
+            if (wa.Top > b.Top) return new Point(wa.Right - pad, wa.Top + pad);
+            if (wa.Left > b.Left) return new Point(wa.Left + pad, wa.Bottom - pad);
             return new Point(wa.Right - pad, wa.Bottom - pad);
         }
 
@@ -573,47 +485,42 @@ namespace VolMixerTray
         {
             try
             {
-                if (sndVol == null || sndVol.HasExited ||
-                    (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
+                if (sndVol == null || sndVol.HasExited || (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
                 {
                     timer.Stop();
                     return;
                 }
 
-                // Use PHYSICAL mouse pos
-                POINT pnt; if (!GetCursorPos(out pnt)) return;
+                POINT pnt;
+                if (!GetCursorPos(out pnt)) return;
                 Point pos = new Point(pnt.X, pnt.Y);
 
                 if (safeZoneBRQ.Contains(pos)) return;
 
                 if (DateTime.UtcNow >= graceUntilUtc)
                 {
-                    int dx = Math.Abs(pos.X - startMouse.X);
-                    int dy = Math.Abs(pos.Y - startMouse.Y);
-                    if (dx > distancePx || dy > distancePx)
+                    if (Math.Abs(pos.X - startMouse.X) > distancePx || Math.Abs(pos.Y - startMouse.Y) > distancePx)
                     {
-                        try { sndVol.Kill(); } catch { }
+                        CloseSndVolGracefully();
                         timer.Stop();
                     }
                 }
             }
-            catch
-            {
-                // keep tray alive on any watcher error
-            }
+            catch { }
         }
 
         protected override void Dispose(bool disposing)
         {
             if (disposing)
             {
-                if (themeTimer != null) themeTimer.Dispose();
+                if (themeWatcher != null) themeWatcher.Dispose();
                 if (timer != null) timer.Dispose();
-                if (menu != null)  menu.Dispose();
-                if (tray != null)  { try { tray.Visible = false; } catch { } tray.Dispose(); }
+                if (windowFindTimer != null) windowFindTimer.Dispose();
+                if (menu != null) menu.Dispose();
+                if (tray != null) { try { tray.Visible = false; } catch { } tray.Dispose(); }
                 if (sndVol != null) sndVol.Dispose();
                 if (lightIcon != null) lightIcon.Dispose();
-                if (darkIcon  != null) darkIcon.Dispose();
+                if (darkIcon != null) darkIcon.Dispose();
                 if (exeFallbackIcon != null) exeFallbackIcon.Dispose();
             }
             base.Dispose(disposing);
