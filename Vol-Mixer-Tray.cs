@@ -99,7 +99,7 @@ namespace VolMixerTray
         IconThemeMode iconMode = IconThemeMode.Auto;
         AppLanguage currentLanguage;
 
-        ToolStripMenuItem miOpenMixer, miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
+        ToolStripMenuItem miOpenMixer, miClassicSoundPanel, miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
         ToolStripMenuItem miLanguageRoot, miLangEn, miLangEs, miStartup, miExit;
 
         // ===== Win32 helpers =====
@@ -209,7 +209,10 @@ namespace VolMixerTray
             darkIcon = LoadEmbeddedIcon(DarkIconRes);
 
             menu = new ContextMenuStrip();
-            miOpenMixer = new ToolStripMenuItem("Open Volume Mixer", null, OpenClick);
+            
+            // Native Launchers
+            miOpenMixer = new ToolStripMenuItem("Volume Mixer (Modern)", null, OpenClick);
+            miClassicSoundPanel = new ToolStripMenuItem("Sound Panel (Classic)", null, ClassicSoundClick);
 
             miThemeRoot = new ToolStripMenuItem("Tray Icon Theme");
             miThemeAuto = new ToolStripMenuItem("Follow Windows theme (Auto)", null, delegate { SetIconMode(IconThemeMode.Auto); });
@@ -228,7 +231,18 @@ namespace VolMixerTray
 
             miExit = new ToolStripMenuItem("Exit", null, ExitClick);
 
-            menu.Items.AddRange(new ToolStripItem[] { miOpenMixer, miThemeRoot, miLanguageRoot, new ToolStripSeparator(), miStartup, new ToolStripSeparator(), miExit });
+            // Add all items to the menu
+            menu.Items.AddRange(new ToolStripItem[] { 
+                miOpenMixer, 
+                miClassicSoundPanel, 
+                new ToolStripSeparator(), 
+                miThemeRoot, 
+                miLanguageRoot, 
+                new ToolStripSeparator(), 
+                miStartup, 
+                new ToolStripSeparator(), 
+                miExit 
+            });
 
             tray = new NotifyIcon { Icon = exeFallbackIcon, Visible = true, ContextMenuStrip = menu };
             tray.MouseClick += TrayClick;
@@ -313,7 +327,11 @@ namespace VolMixerTray
         void ApplyLanguage()
         {
             bool es = currentLanguage == AppLanguage.Spanish;
-            if (miOpenMixer != null) miOpenMixer.Text = es ? "Abrir mezclador de volumen" : "Open Volume Mixer";
+            
+            // Modern and Classic shortcuts localized
+            if (miOpenMixer != null) miOpenMixer.Text = es ? "Mezclador de volumen (Moderno)" : "Volume Mixer (Modern)";
+            if (miClassicSoundPanel != null) miClassicSoundPanel.Text = es ? "Panel de sonido (Clásico)" : "Sound Panel (Classic)";
+            
             if (miThemeRoot != null) miThemeRoot.Text = es ? "Tema del icono" : "Tray Icon Theme";
             if (miThemeAuto != null) miThemeAuto.Text = es ? "Auto (Seguir sistema)" : "Follow Windows theme (Auto)";
             if (miThemeLight != null) miThemeLight.Text = es ? "Usar icono oscuro" : "Use Dark Icon";
@@ -377,12 +395,18 @@ namespace VolMixerTray
 
         void TrayClick(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Toggle(); }
         void OpenClick(object s, EventArgs e) { OpenVolumeMixerSettings(); }
+        void ClassicSoundClick(object s, EventArgs e) { OpenClassicSoundPanel(); }
         void ExitClick(object s, EventArgs e) { try { tray.Visible = false; } catch { } ExitThread(); }
 
         static void OpenVolumeMixerSettings()
         {
             try { Process.Start(new ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true }); return; } catch { }
             try { Process.Start(new ProcessStartInfo("ms-settings:sound") { UseShellExecute = true }); } catch { }
+        }
+
+        static void OpenClassicSoundPanel()
+        {
+            try { Process.Start(new ProcessStartInfo("control.exe", "mmsys.cpl sounds") { UseShellExecute = true }); } catch { }
         }
 
         void CloseSndVolGracefully()
