@@ -81,8 +81,8 @@ namespace VolMixerTray
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        readonly Timer timer;             // watch distance
-        readonly Timer windowFindTimer;   // non-blocking window search
+        readonly Timer timer;             // shared auto-close watcher
+        readonly Timer windowFindTimer;   // non-blocking legacy window search
         readonly int totalWatchMs, pollMs, distancePx, pad;
         readonly bool useMouseMonitor;
 
@@ -118,6 +118,8 @@ namespace VolMixerTray
         [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
 
         static readonly IntPtr HWND_TOP = IntPtr.Zero;
         const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
@@ -224,7 +226,6 @@ namespace VolMixerTray
 
             menu = new ContextMenuStrip();
 
-            // Choose what a left-click on the tray icon opens
             miOpenModeRoot = new ToolStripMenuItem("Open from tray");
             miOpenLegacy = new ToolStripMenuItem("Legacy Volume Mixer", null, delegate { SetTrayOpenMode(TrayOpenMode.LegacyMixer); });
             miOpenSoundOutput = new ToolStripMenuItem("Sound Output", null, delegate { SetTrayOpenMode(TrayOpenMode.SoundOutput); });
@@ -247,7 +248,6 @@ namespace VolMixerTray
 
             miExit = new ToolStripMenuItem("Exit", null, ExitClick);
 
-            // Add all items to the menu
             menu.Items.AddRange(new ToolStripItem[] {
                 miOpenModeRoot,
                 new ToolStripSeparator(),
@@ -454,6 +454,7 @@ namespace VolMixerTray
             if (trayOpenMode == TrayOpenMode.SoundOutput)
             {
                 OpenSoundOutput();
+                StartSoundOutputWatcher();
                 return;
             }
 
@@ -477,10 +478,28 @@ namespace VolMixerTray
             catch { }
         }
 
+        void StartSoundOutputWatcher()
+        {
+            POINT pnt;
+            if (!GetCursorPos(out pnt)) return;
+
+            // The same start point, grace period, timeout and distance used by Legacy.
+            startMouse = new Point(pnt.X, pnt.Y);
+            startedUtc = DateTime.UtcNow;
+            graceUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
+
+            Screen scr = useMouseMonitor ? Screen.FromPoint(startMouse) : Screen.PrimaryScreen;
+            activeBounds = scr.Bounds;
+            safeZoneBRQ = new Rectangle(activeBounds.Left + activeBounds.Width / 2, activeBounds.Top + activeBounds.Height / 2, activeBounds.Width / 2, activeBounds.Height / 2);
+
+            timer.Start();
+        }
+
         void ToggleLegacyMixer()
         {
             try
             {
+                timer.Stop();
                 CloseSndVolGracefully();
 
                 if (sndVol != null && !sndVol.HasExited)
@@ -541,7 +560,7 @@ namespace VolMixerTray
                 MoveWindowBottomRight(h, activeBounds, anchor);
                 windowFindTimer.Stop();
             }
-            else if (findTicks > 60) // Stop after ~3 seconds
+            else if (findTicks > 60)
             {
                 windowFindTimer.Stop();
             }
@@ -561,15 +580,20 @@ namespace VolMixerTray
         {
             try
             {
-                if (sndVol == null || sndVol.HasExited || (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
+                POINT pnt;
+                if (!GetCursorPos(out pnt)) return;
+                Point pos = new Point(pnt.X, pnt.Y);
+
+                // Legacy mixer: it is no longer open, so stop watching.
+                // Sound Output: there is no sndVol process; use the same watcher rules instead.
+                bool watchingSoundOutput = trayOpenMode == TrayOpenMode.SoundOutput && sndVol == null;
+                bool watchingLegacy = sndVol != null && !sndVol.HasExited;
+
+                if ((!watchingLegacy && !watchingSoundOutput) || (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
                 {
                     timer.Stop();
                     return;
                 }
-
-                POINT pnt;
-                if (!GetCursorPos(out pnt)) return;
-                Point pos = new Point(pnt.X, pnt.Y);
 
                 if (safeZoneBRQ.Contains(pos)) return;
 
@@ -577,7 +601,14 @@ namespace VolMixerTray
                 {
                     if (Math.Abs(pos.X - startMouse.X) > distancePx || Math.Abs(pos.Y - startMouse.Y) > distancePx)
                     {
-                        CloseSndVolGracefully();
+                        if (watchingLegacy)
+                        {
+                            CloseSndVolGracefully();
+                        }
+                        else if (watchingSoundOutput)
+                        {
+                            DismissSoundOutputFlyout();
+                        }
                         timer.Stop();
                     }
                 }
@@ -585,16 +616,26 @@ namespace VolMixerTray
             catch { }
         }
 
+        static void DismissSoundOutputFlyout()
+        {
+            try
+            {
+                // The Sound Output UI is a Windows shell flyout rather than our process.
+                // Escape dismisses the flyout without changing any audio setting.
+                keybd_event(0x1B, 0, 0, UIntPtr.Zero); // VK_ESCAPE
+                keybd_event(0x1B, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            }
+            catch { }
+        }
+
         void CloseSndVolGracefully()
         {
-            // Try graceful close via PostMessage first to save user settings
             if (sndVolHandle != IntPtr.Zero)
             {
                 PostMessage(sndVolHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                 sndVolHandle = IntPtr.Zero;
             }
 
-            // Backup killer for any orphaned process
             if (sndVol != null && !sndVol.HasExited)
             {
                 try { sndVol.CloseMainWindow(); } catch { }
