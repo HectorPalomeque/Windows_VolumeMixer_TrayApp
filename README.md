@@ -2,7 +2,7 @@
 
 A lightweight Windows tray utility that provides quick access to either the **Legacy Volume Mixer (SndVol.exe)** or the Windows **Sound Output** flyout, with modern enhancements.
 
-Opens instantly from the tray and includes **theme-aware tray icons**, **auto monitor detection** for the Legacy mixer, **automatic Legacy mixer positioning/closing**, and **optional auto-start setup**.
+Opens instantly from the tray and includes **theme-aware tray icons**, **auto monitor detection** for the Legacy mixer, **automatic mouse-distance closing** for both tray-opening modes, and **optional auto-start setup**.
 
 ---
 
@@ -17,7 +17,7 @@ Opens instantly from the tray and includes **theme-aware tray icons**, **auto mo
 - Your tray-opening choice is saved and restored automatically
 - Auto-detects the **current monitor** for the Legacy Volume Mixer
 - Positions the Legacy mixer at **bottom-right** of the active screen
-- Legacy mixer auto-closes when the mouse moves away (custom distance)
+- **Auto-closes after the mouse moves farther than the configured distance** in both Legacy and Sound Output modes
 - **Theme-aware icons** (auto, light, dark)
 - Portable — all files in one folder, no installer
 - Compiles easily using the included **Build.bat**
@@ -33,9 +33,26 @@ Right-click the tray icon and open:
 You can choose:
 
 - **Legacy Volume Mixer** — opens the traditional Windows `SndVol.exe` mixer. The existing monitor-aware positioning and automatic closing behavior are preserved.
-- **Sound Output** — simulates **Win+Ctrl+V**, opening the Windows Sound Output device flyout.
+- **Sound Output** — simulates **Win+Ctrl+V**, opening the Windows Sound Output device flyout. The same mouse-distance watcher is also active in this mode.
 
 The selected option is marked with a checkmark and is stored in the current user's registry, so it remains selected after restarting the app or Windows.
+
+---
+
+## ✨ Auto-Close Behavior
+
+The same mouse-distance auto-close system is used for both tray-opening modes.
+
+When either mode is opened:
+
+- The current mouse position is recorded as the starting point.
+- A short grace period prevents immediate closure while the interface is opening.
+- The existing configurable **distance** (`distancePx`) determines how far the mouse can move before the interface is dismissed.
+- The existing bottom-right safe zone remains available to make movement from the tray toward the interface comfortable.
+
+For the **Legacy Volume Mixer**, the existing `SndVol.exe` window is closed gracefully.
+
+For **Sound Output**, the Windows shell flyout is dismissed using **Escape**, without changing the selected audio device or volume.
 
 ---
 
@@ -56,15 +73,14 @@ You may manually override via tray menu:
 
 ## 🖥 Monitor-Aware Legacy Mixer Positioning
 
-The monitor-aware positioning and auto-close behavior apply to the **Legacy Volume Mixer** mode:
+The monitor-aware positioning behavior applies to the **Legacy Volume Mixer** mode:
 
 - Detects which screen the mouse is on
 - Opens the Legacy mixer on that same screen
 - Anchors to **bottom-right corner** (adjusted for taskbar position)
 - If the `-t` parameter is ignored by Windows, the app force-moves the window
-- Automatically closes the Legacy mixer when the mouse moves sufficiently far away
 
-The **Sound Output** mode uses the Windows flyout directly and does not apply the Legacy mixer window-positioning/auto-close logic.
+Sound Output uses the Windows flyout directly and therefore does not need Legacy window positioning.
 
 ---
 
@@ -113,7 +129,7 @@ VolumeMixer_TrayApp/
 
 You can configure VolumeMixer Tray App to run automatically on Windows startup.
 
-Choose one of the following options depending on whether you want auto-start for **all users** or only **your current user**.
+Choose one of the following options depending on whether you want auto-start for **all users** or only your **current user**.
 
 ---
 
