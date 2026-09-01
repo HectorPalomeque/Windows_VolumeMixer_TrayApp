@@ -13,7 +13,6 @@ namespace VolMixerTray
 {
     static class Program
     {
-        // Modern DPI Awareness (Per-Monitor V2) with fallback
         [DllImport("user32.dll", SetLastError = true)]
         static extern int SetProcessDpiAwarenessContext(int dpiFlag);
         const int DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4;
@@ -31,7 +30,6 @@ namespace VolMixerTray
         static void Main(string[] args)
         {
             EnableDPI();
-
             try
             {
                 int timeoutMs = 30000;
@@ -52,7 +50,6 @@ namespace VolMixerTray
                 using (var m = new Mutex(true, @"VolMixerTray_Mutex", out first))
                 {
                     if (!first) return;
-
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
                     Application.Run(new TrayContext(timeoutMs, pollMs, distancePx, pad, useMouseMonitor));
@@ -81,8 +78,8 @@ namespace VolMixerTray
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
-        readonly Timer timer;             // shared auto-close watcher
-        readonly Timer windowFindTimer;   // non-blocking legacy window search
+        readonly Timer timer;
+        readonly Timer windowFindTimer;
         readonly int totalWatchMs, pollMs, distancePx, pad;
         readonly bool useMouseMonitor;
 
@@ -96,6 +93,7 @@ namespace VolMixerTray
         Process sndVol;
         IntPtr sndVolHandle = IntPtr.Zero;
         int findTicks = 0;
+        bool soundOutputWatcherActive = false;
 
         Icon exeFallbackIcon, lightIcon, darkIcon;
         IconThemeMode iconMode = IconThemeMode.Auto;
@@ -106,7 +104,6 @@ namespace VolMixerTray
         ToolStripMenuItem miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
         ToolStripMenuItem miLanguageRoot, miLangEn, miLangEs, miStartup, miExit;
 
-        // ===== Win32 helpers =====
         [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
         [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT pt);
 
@@ -119,21 +116,20 @@ namespace VolMixerTray
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hWnd);
 
         static readonly IntPtr HWND_TOP = IntPtr.Zero;
         const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
         const uint WM_CLOSE = 0x0010;
 
-        // Keyboard helpers for Win+Ctrl+V (Windows Sound Output flyout)
         [DllImport("user32.dll", SetLastError = true)]
         static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         const uint KEYEVENTF_KEYUP = 0x0002;
         const byte VK_LWIN = 0x5B;
         const byte VK_LCONTROL = 0xA2;
         const byte VK_V = 0x56;
+        const byte VK_ESCAPE = 0x1B;
 
-        // Theme Event Watcher
         sealed class SystemEventWatcher : NativeWindow, IDisposable
         {
             private const int WM_SETTINGCHANGE = 0x001A;
@@ -188,16 +184,21 @@ namespace VolMixerTray
             return found;
         }
 
+        static IntPtr FindSoundOutputWindow()
+        {
+            IntPtr foreground = GetForegroundWindow();
+            if (foreground == IntPtr.Zero) return IntPtr.Zero;
+            return foreground;
+        }
+
         static void MoveWindowBottomRight(IntPtr hWnd, Rectangle screenBounds, Point anchorBR)
         {
             RECT r;
             if (!GetWindowRect(hWnd, out r)) return;
             int w = r.Right - r.Left;
             int h = r.Bottom - r.Top;
-
             int x = Math.Max(screenBounds.Left, Math.Min(anchorBR.X - w, screenBounds.Right - w));
             int y = Math.Max(screenBounds.Top, Math.Min(anchorBR.Y - h, screenBounds.Bottom - h));
-
             SetWindowPos(hWnd, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
@@ -218,14 +219,11 @@ namespace VolMixerTray
 
             try { exeFallbackIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
             catch { exeFallbackIcon = SystemIcons.Application; }
-
             lightIcon = LoadEmbeddedIcon(LightIconRes);
             darkIcon = LoadEmbeddedIcon(DarkIconRes);
-
             trayOpenMode = DetectInitialOpenMode();
 
             menu = new ContextMenuStrip();
-
             miOpenModeRoot = new ToolStripMenuItem("Open from tray");
             miOpenLegacy = new ToolStripMenuItem("Legacy Volume Mixer", null, delegate { SetTrayOpenMode(TrayOpenMode.LegacyMixer); });
             miOpenSoundOutput = new ToolStripMenuItem("Sound Output", null, delegate { SetTrayOpenMode(TrayOpenMode.SoundOutput); });
@@ -245,7 +243,6 @@ namespace VolMixerTray
             miStartup = new ToolStripMenuItem("Run at Startup");
             miStartup.Click += delegate { ToggleRunAtStartup(); };
             menu.Opening += delegate { miStartup.Checked = IsRunAtStartupEnabled(); };
-
             miExit = new ToolStripMenuItem("Exit", null, ExitClick);
 
             menu.Items.AddRange(new ToolStripItem[] {
@@ -264,7 +261,6 @@ namespace VolMixerTray
 
             timer = new Timer { Interval = this.pollMs };
             timer.Tick += TimerTick;
-
             windowFindTimer = new Timer { Interval = 50 };
             windowFindTimer.Tick += WindowFindTimerTick;
 
@@ -346,6 +342,8 @@ namespace VolMixerTray
         void SetTrayOpenMode(TrayOpenMode mode)
         {
             trayOpenMode = mode;
+            CloseSoundOutputWatcher();
+            timer.Stop();
             try
             {
                 using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegKeyPath))
@@ -381,11 +379,9 @@ namespace VolMixerTray
         void ApplyLanguage()
         {
             bool es = currentLanguage == AppLanguage.Spanish;
-
             if (miOpenModeRoot != null) miOpenModeRoot.Text = es ? "Abrir desde la bandeja" : "Open from tray";
             if (miOpenLegacy != null) miOpenLegacy.Text = es ? "Mezclador de volumen heredado" : "Legacy Volume Mixer";
             if (miOpenSoundOutput != null) miOpenSoundOutput.Text = es ? "Salida de sonido" : "Sound Output";
-
             if (miThemeRoot != null) miThemeRoot.Text = es ? "Tema del icono" : "Tray Icon Theme";
             if (miThemeAuto != null) miThemeAuto.Text = es ? "Auto (Seguir sistema)" : "Follow Windows theme (Auto)";
             if (miThemeLight != null) miThemeLight.Text = es ? "Usar icono oscuro" : "Use Dark Icon";
@@ -395,10 +391,8 @@ namespace VolMixerTray
             if (miLangEs != null) miLangEs.Text = es ? "Español" : "Spanish";
             if (miStartup != null) miStartup.Text = es ? "Ejecutar al iniciar Windows" : "Run at Startup";
             if (miExit != null) miExit.Text = es ? "Salir (Cerrar App)" : "Exit (Close App)";
-
-            if (miLangEn != null) miLangEn.Checked = (currentLanguage == AppLanguage.English);
-            if (miLangEs != null) miLangEs.Checked = (currentLanguage == AppLanguage.Spanish);
-
+            if (miLangEn != null) miLangEn.Checked = currentLanguage == AppLanguage.English;
+            if (miLangEs != null) miLangEs.Checked = currentLanguage == AppLanguage.Spanish;
             if (tray != null) tray.Text = es ? "Mezclador de volumen" : "Volume Mixer";
         }
 
@@ -411,9 +405,9 @@ namespace VolMixerTray
         void SetIconMode(IconThemeMode mode)
         {
             iconMode = mode;
-            if (miThemeAuto != null) miThemeAuto.Checked = (mode == IconThemeMode.Auto);
-            if (miThemeLight != null) miThemeLight.Checked = (mode == IconThemeMode.Light);
-            if (miThemeDark != null) miThemeDark.Checked = (mode == IconThemeMode.Dark);
+            if (miThemeAuto != null) miThemeAuto.Checked = mode == IconThemeMode.Auto;
+            if (miThemeLight != null) miThemeLight.Checked = mode == IconThemeMode.Light;
+            if (miThemeDark != null) miThemeDark.Checked = mode == IconThemeMode.Dark;
             ApplyTrayIcon();
         }
 
@@ -450,24 +444,28 @@ namespace VolMixerTray
         void TrayClick(object sender, MouseEventArgs e)
         {
             if (e.Button != MouseButtons.Left) return;
-
-            if (trayOpenMode == TrayOpenMode.SoundOutput)
-            {
-                OpenSoundOutput();
-                StartSoundOutputWatcher();
-                return;
-            }
-
-            ToggleLegacyMixer();
+            if (trayOpenMode == TrayOpenMode.SoundOutput) OpenSoundOutput();
+            else ToggleLegacyMixer();
         }
 
         void ExitClick(object s, EventArgs e) { try { tray.Visible = false; } catch { } ExitThread(); }
 
-        static void OpenSoundOutput()
+        void OpenSoundOutput()
         {
             try
             {
-                // Simulate Win+Ctrl+V using keybd_event so the same Windows flyout opens.
+                CloseSndVolGracefully();
+                POINT pnt;
+                GetCursorPos(out pnt);
+                startMouse = new Point(pnt.X, pnt.Y);
+                Screen scr = useMouseMonitor ? Screen.FromPoint(startMouse) : Screen.PrimaryScreen;
+                activeBounds = scr.Bounds;
+                safeZoneBRQ = new Rectangle(activeBounds.Left + activeBounds.Width / 2, activeBounds.Top + activeBounds.Height / 2, activeBounds.Width / 2, activeBounds.Height / 2);
+                graceUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
+                startedUtc = DateTime.UtcNow;
+                soundOutputWatcherActive = true;
+                timer.Start();
+
                 keybd_event(VK_LWIN, 0, 0, UIntPtr.Zero);
                 keybd_event(VK_LCONTROL, 0, 0, UIntPtr.Zero);
                 keybd_event(VK_V, 0, 0, UIntPtr.Zero);
@@ -475,31 +473,28 @@ namespace VolMixerTray
                 keybd_event(VK_LCONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
                 keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
             }
-            catch { }
+            catch { CloseSoundOutputWatcher(); }
         }
 
-        void StartSoundOutputWatcher()
+        void CloseSoundOutputWatcher()
         {
-            POINT pnt;
-            if (!GetCursorPos(out pnt)) return;
+            if (!soundOutputWatcherActive) return;
+            soundOutputWatcherActive = false;
+            SendEscape();
+            timer.Stop();
+        }
 
-            // The same start point, grace period, timeout and distance used by Legacy.
-            startMouse = new Point(pnt.X, pnt.Y);
-            startedUtc = DateTime.UtcNow;
-            graceUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
-
-            Screen scr = useMouseMonitor ? Screen.FromPoint(startMouse) : Screen.PrimaryScreen;
-            activeBounds = scr.Bounds;
-            safeZoneBRQ = new Rectangle(activeBounds.Left + activeBounds.Width / 2, activeBounds.Top + activeBounds.Height / 2, activeBounds.Width / 2, activeBounds.Height / 2);
-
-            timer.Start();
+        static void SendEscape()
+        {
+            keybd_event(VK_ESCAPE, 0, 0, UIntPtr.Zero);
+            keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
 
         void ToggleLegacyMixer()
         {
             try
             {
-                timer.Stop();
+                CloseSoundOutputWatcher();
                 CloseSndVolGracefully();
 
                 if (sndVol != null && !sndVol.HasExited)
@@ -515,7 +510,6 @@ namespace VolMixerTray
                 Screen scr = useMouseMonitor ? Screen.FromPoint(physMouse) : Screen.PrimaryScreen;
                 activeBounds = scr.Bounds;
                 safeZoneBRQ = new Rectangle(activeBounds.Left + activeBounds.Width / 2, activeBounds.Top + activeBounds.Height / 2, activeBounds.Width / 2, activeBounds.Height / 2);
-
                 anchor = ComputeAnchor(scr, pad);
                 int packed = ((anchor.Y & 0xFFFF) << 16) | (anchor.X & 0xFFFF);
 
@@ -537,7 +531,6 @@ namespace VolMixerTray
                 startMouse = physMouse;
                 graceUntilUtc = DateTime.UtcNow.AddMilliseconds(250);
                 startedUtc = DateTime.UtcNow;
-
                 findTicks = 0;
                 windowFindTimer.Start();
                 timer.Start();
@@ -551,7 +544,6 @@ namespace VolMixerTray
         void WindowFindTimerTick(object sender, EventArgs e)
         {
             if (sndVol == null || sndVol.HasExited) { windowFindTimer.Stop(); return; }
-
             findTicks++;
             IntPtr h = FindTopLevelWindowByPid(sndVol.Id);
             if (h != IntPtr.Zero)
@@ -560,10 +552,7 @@ namespace VolMixerTray
                 MoveWindowBottomRight(h, activeBounds, anchor);
                 windowFindTimer.Stop();
             }
-            else if (findTicks > 60)
-            {
-                windowFindTimer.Stop();
-            }
+            else if (findTicks > 60) windowFindTimer.Stop();
         }
 
         static Point ComputeAnchor(Screen scr, int pad)
@@ -580,50 +569,44 @@ namespace VolMixerTray
         {
             try
             {
-                POINT pnt;
-                if (!GetCursorPos(out pnt)) return;
-                Point pos = new Point(pnt.X, pnt.Y);
+                if (trayOpenMode == TrayOpenMode.SoundOutput && soundOutputWatcherActive)
+                {
+                    if ((DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
+                    {
+                        CloseSoundOutputWatcher();
+                        return;
+                    }
 
-                // Legacy mixer: it is no longer open, so stop watching.
-                // Sound Output: there is no sndVol process; use the same watcher rules instead.
-                bool watchingSoundOutput = trayOpenMode == TrayOpenMode.SoundOutput && sndVol == null;
-                bool watchingLegacy = sndVol != null && !sndVol.HasExited;
+                    POINT pnt;
+                    if (!GetCursorPos(out pnt)) return;
+                    Point pos = new Point(pnt.X, pnt.Y);
+                    if (safeZoneBRQ.Contains(pos)) return;
 
-                if ((!watchingLegacy && !watchingSoundOutput) || (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
+                    if (DateTime.UtcNow >= graceUntilUtc &&
+                        (Math.Abs(pos.X - startMouse.X) > distancePx || Math.Abs(pos.Y - startMouse.Y) > distancePx))
+                    {
+                        CloseSoundOutputWatcher();
+                    }
+                    return;
+                }
+
+                if (sndVol == null || sndVol.HasExited || (DateTime.UtcNow - startedUtc).TotalMilliseconds > totalWatchMs)
                 {
                     timer.Stop();
                     return;
                 }
 
-                if (safeZoneBRQ.Contains(pos)) return;
+                POINT legacyPoint;
+                if (!GetCursorPos(out legacyPoint)) return;
+                Point legacyPos = new Point(legacyPoint.X, legacyPoint.Y);
+                if (safeZoneBRQ.Contains(legacyPos)) return;
 
-                if (DateTime.UtcNow >= graceUntilUtc)
+                if (DateTime.UtcNow >= graceUntilUtc &&
+                    (Math.Abs(legacyPos.X - startMouse.X) > distancePx || Math.Abs(legacyPos.Y - startMouse.Y) > distancePx))
                 {
-                    if (Math.Abs(pos.X - startMouse.X) > distancePx || Math.Abs(pos.Y - startMouse.Y) > distancePx)
-                    {
-                        if (watchingLegacy)
-                        {
-                            CloseSndVolGracefully();
-                        }
-                        else if (watchingSoundOutput)
-                        {
-                            DismissSoundOutputFlyout();
-                        }
-                        timer.Stop();
-                    }
+                    CloseSndVolGracefully();
+                    timer.Stop();
                 }
-            }
-            catch { }
-        }
-
-        static void DismissSoundOutputFlyout()
-        {
-            try
-            {
-                // The Sound Output UI is a Windows shell flyout rather than our process.
-                // Escape dismisses the flyout without changing any audio setting.
-                keybd_event(0x1B, 0, 0, UIntPtr.Zero); // VK_ESCAPE
-                keybd_event(0x1B, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
             }
             catch { }
         }
@@ -635,7 +618,6 @@ namespace VolMixerTray
                 PostMessage(sndVolHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
                 sndVolHandle = IntPtr.Zero;
             }
-
             if (sndVol != null && !sndVol.HasExited)
             {
                 try { sndVol.CloseMainWindow(); } catch { }
