@@ -1,22 +1,41 @@
 # 🎧 VolumeMixer Tray App
 
-A lightweight Windows tray utility that restores the **classic Volume Mixer (SndVol.exe)** with modern enhancements.  
-Opens instantly from the tray, positions itself on the correct monitor, and closes automatically when you move away.  
-Includes **theme-aware tray icons**, **auto monitor detection**, and **optional auto-start setup**.
+A lightweight Windows tray utility that provides quick access to either the **Legacy Volume Mixer (SndVol.exe)** or the Windows **Sound Output** flyout, with modern enhancements.
+
+Opens instantly from the tray and includes **theme-aware tray icons**, **auto monitor detection** for the Legacy mixer, **automatic Legacy mixer positioning/closing**, and **optional auto-start setup**.
 
 ---
 
 ## ⭐ Key Features
 
 - Runs quietly in the **system tray**
-- **Left-click** → Opens the classic Volume Mixer
+- **Left-click** → Opens the selected tray target
+  - **Legacy Volume Mixer** — the traditional `SndVol.exe` mixer
+  - **Sound Output** — opens the Windows Sound Output flyout by simulating **Win+Ctrl+V**
 - **Right-click** → Context menu with settings
-- Auto-detects the **current monitor**
-- Positions SndVol.exe at **bottom-right** of the active screen
-- Auto-closes when mouse moves away (custom distance)
+- **Open from tray** submenu lets you choose which target left-click opens
+- Your tray-opening choice is saved and restored automatically
+- Auto-detects the **current monitor** for the Legacy Volume Mixer
+- Positions the Legacy mixer at **bottom-right** of the active screen
+- Legacy mixer auto-closes when the mouse moves away (custom distance)
 - **Theme-aware icons** (auto, light, dark)
 - Portable — all files in one folder, no installer
 - Compiles easily using the included **Build.bat**
+
+---
+
+## 🖱 Tray Opening Mode
+
+Right-click the tray icon and open:
+
+**Open from tray**
+
+You can choose:
+
+- **Legacy Volume Mixer** — opens the traditional Windows `SndVol.exe` mixer. The existing monitor-aware positioning and automatic closing behavior are preserved.
+- **Sound Output** — simulates **Win+Ctrl+V**, opening the Windows Sound Output device flyout.
+
+The selected option is marked with a checkmark and is stored in the current user's registry, so it remains selected after restarting the app or Windows.
 
 ---
 
@@ -35,12 +54,17 @@ You may manually override via tray menu:
 
 ---
 
-## 🖥 Monitor-Aware Mixer Positioning
+## 🖥 Monitor-Aware Legacy Mixer Positioning
 
-- Detects which screen the mouse is on  
-- Opens the classic mixer on that same screen  
-- Anchors to **bottom-right corner** (adjusted for taskbar position)  
-- If `-t` parameter is ignored by Windows, the app force-moves the window
+The monitor-aware positioning and auto-close behavior apply to the **Legacy Volume Mixer** mode:
+
+- Detects which screen the mouse is on
+- Opens the Legacy mixer on that same screen
+- Anchors to **bottom-right corner** (adjusted for taskbar position)
+- If the `-t` parameter is ignored by Windows, the app force-moves the window
+- Automatically closes the Legacy mixer when the mouse moves sufficiently far away
+
+The **Sound Output** mode uses the Windows flyout directly and does not apply the Legacy mixer window-positioning/auto-close logic.
 
 ---
 
@@ -49,29 +73,23 @@ You may manually override via tray menu:
 Place these files together in the same folder:
 
 ```
-
 Vol-Mixer-Tray.cs
 Build.bat
 volmixer.ico
 volmixer_black.ico
 batch_g2_VolMixer.ico
-
 ```
 
 Then run:
 
 ```
-
 Build.bat
-
 ```
 
 This generates:
 
 ```
-
 VolMixerTray.exe
-
 ```
 
 ---
@@ -79,7 +97,6 @@ VolMixerTray.exe
 ## 📂 Project Structure
 
 ```
-
 VolumeMixer_TrayApp/
 │
 ├── Vol-Mixer-Tray.cs          # Main source code
@@ -88,7 +105,6 @@ VolumeMixer_TrayApp/
 ├── volmixer_black.ico         # Light theme tray icon
 ├── batch_g2_VolMixer.ico      # Executable icon
 └── README.md
-
 ```
 
 ---
@@ -101,42 +117,38 @@ Choose one of the following options depending on whether you want auto-start for
 
 ---
 
-## 🟦 Auto-Start for ALL Users  
+## 🟦 Auto-Start for ALL Users
 *(recommended for shared computers)*
 
 Place **either the `.exe` or a shortcut** in:
 
 ```
-
 C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
-
 ```
 
 ✔ Launches for **every user**  
-⚠ Requires administrator permissions  
+⚠ Requires administrator permissions
 
 ---
 
-## 🟩 Auto-Start for Current User Only  
+## 🟩 Auto-Start for Current User Only
 *(no admin rights required)*
 
 Place a shortcut in your personal Startup folder:
 
 ```
-
 %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-
-````
+```
 
 ✔ Runs every time *you* log in  
-✔ No admin permissions needed  
+✔ No admin permissions needed
 
 ---
 
 ### Notes
 
 - The app runs quietly in the **system tray**
-- Uses extremely low system resources  
+- Uses extremely low system resources
 - Compatible with **Windows 10 and Windows 11**
 
 ---
@@ -163,14 +175,14 @@ echo.
 echo Build complete! If no errors were shown, VolMixerTray.exe is ready.
 echo.
 pause
-````
+```
 
 ---
 
 ## 📄 License
 
 Licensed under the **MIT License**.
-You may modify, distribute, and use this software freely.
+You may modify, distribute, and use the software freely.
 
 ---
 
