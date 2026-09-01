@@ -73,9 +73,11 @@ namespace VolMixerTray
 
         enum IconThemeMode { Auto = 0, Light = 1, Dark = 2 }
         enum AppLanguage { English = 0, Spanish = 1 }
+        enum TrayOpenMode { LegacyMixer = 0, SoundOutput = 1 }
 
-        const string RegLangKeyPath = @"Software\VolMixerTray";
+        const string RegKeyPath = @"Software\VolMixerTray";
         const string RegLangValue = "Language";
+        const string RegOpenModeValue = "TrayOpenMode";
 
         readonly NotifyIcon tray;
         readonly ContextMenuStrip menu;
@@ -90,7 +92,7 @@ namespace VolMixerTray
         DateTime graceUntilUtc;
         Rectangle activeBounds;
         Rectangle safeZoneBRQ;
-        
+
         Process sndVol;
         IntPtr sndVolHandle = IntPtr.Zero;
         int findTicks = 0;
@@ -98,8 +100,10 @@ namespace VolMixerTray
         Icon exeFallbackIcon, lightIcon, darkIcon;
         IconThemeMode iconMode = IconThemeMode.Auto;
         AppLanguage currentLanguage;
+        TrayOpenMode trayOpenMode;
 
-        ToolStripMenuItem miOpenMixer, miClassicSoundPanel, miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
+        ToolStripMenuItem miOpenModeRoot, miOpenLegacy, miOpenSoundOutput;
+        ToolStripMenuItem miThemeRoot, miThemeAuto, miThemeLight, miThemeDark;
         ToolStripMenuItem miLanguageRoot, miLangEn, miLangEs, miStartup, miExit;
 
         // ===== Win32 helpers =====
@@ -118,6 +122,14 @@ namespace VolMixerTray
         static readonly IntPtr HWND_TOP = IntPtr.Zero;
         const uint SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004, SWP_NOACTIVATE = 0x0010;
         const uint WM_CLOSE = 0x0010;
+
+        // Keyboard helpers for Win+Ctrl+V (Windows Sound Output flyout)
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        const uint KEYEVENTF_KEYUP = 0x0002;
+        const byte VK_LWIN = 0x5B;
+        const byte VK_LCONTROL = 0xA2;
+        const byte VK_V = 0x56;
 
         // Theme Event Watcher
         sealed class SystemEventWatcher : NativeWindow, IDisposable
@@ -208,11 +220,15 @@ namespace VolMixerTray
             lightIcon = LoadEmbeddedIcon(LightIconRes);
             darkIcon = LoadEmbeddedIcon(DarkIconRes);
 
+            trayOpenMode = DetectInitialOpenMode();
+
             menu = new ContextMenuStrip();
-            
-            // Native Launchers
-            miOpenMixer = new ToolStripMenuItem("Volume Mixer (Modern)", null, OpenClick);
-            miClassicSoundPanel = new ToolStripMenuItem("Sound Panel (Classic)", null, ClassicSoundClick);
+
+            // Choose what a left-click on the tray icon opens
+            miOpenModeRoot = new ToolStripMenuItem("Open from tray");
+            miOpenLegacy = new ToolStripMenuItem("Legacy Volume Mixer", null, delegate { SetTrayOpenMode(TrayOpenMode.LegacyMixer); });
+            miOpenSoundOutput = new ToolStripMenuItem("Sound Output", null, delegate { SetTrayOpenMode(TrayOpenMode.SoundOutput); });
+            miOpenModeRoot.DropDownItems.AddRange(new[] { miOpenLegacy, miOpenSoundOutput });
 
             miThemeRoot = new ToolStripMenuItem("Tray Icon Theme");
             miThemeAuto = new ToolStripMenuItem("Follow Windows theme (Auto)", null, delegate { SetIconMode(IconThemeMode.Auto); });
@@ -232,16 +248,15 @@ namespace VolMixerTray
             miExit = new ToolStripMenuItem("Exit", null, ExitClick);
 
             // Add all items to the menu
-            menu.Items.AddRange(new ToolStripItem[] { 
-                miOpenMixer, 
-                miClassicSoundPanel, 
-                new ToolStripSeparator(), 
-                miThemeRoot, 
-                miLanguageRoot, 
-                new ToolStripSeparator(), 
-                miStartup, 
-                new ToolStripSeparator(), 
-                miExit 
+            menu.Items.AddRange(new ToolStripItem[] {
+                miOpenModeRoot,
+                new ToolStripSeparator(),
+                miThemeRoot,
+                miLanguageRoot,
+                new ToolStripSeparator(),
+                miStartup,
+                new ToolStripSeparator(),
+                miExit
             });
 
             tray = new NotifyIcon { Icon = exeFallbackIcon, Visible = true, ContextMenuStrip = menu };
@@ -261,15 +276,16 @@ namespace VolMixerTray
             SetIconMode(IconThemeMode.Auto);
             currentLanguage = DetectInitialLanguage();
             ApplyLanguage();
+            UpdateOpenModeChecks();
         }
 
         bool IsRunAtStartupEnabled()
         {
-            try 
-            { 
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false)) 
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", false))
                 {
-                    if (k != null) return k.GetValue(AppId) != null; 
+                    if (k != null) return k.GetValue(AppId) != null;
                 }
             }
             catch { }
@@ -296,7 +312,7 @@ namespace VolMixerTray
         {
             try
             {
-                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RegLangKeyPath))
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RegKeyPath))
                 {
                     if (k != null)
                     {
@@ -310,28 +326,66 @@ namespace VolMixerTray
             return AppLanguage.English;
         }
 
+        static TrayOpenMode DetectInitialOpenMode()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RegKeyPath))
+                {
+                    if (k != null)
+                    {
+                        object v = k.GetValue(RegOpenModeValue);
+                        if (v is int && (int)v == (int)TrayOpenMode.SoundOutput) return TrayOpenMode.SoundOutput;
+                    }
+                }
+            }
+            catch { }
+            return TrayOpenMode.LegacyMixer;
+        }
+
+        void SetTrayOpenMode(TrayOpenMode mode)
+        {
+            trayOpenMode = mode;
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegKeyPath))
+                {
+                    if (k != null) k.SetValue(RegOpenModeValue, (int)mode, RegistryValueKind.DWord);
+                }
+            }
+            catch { }
+            UpdateOpenModeChecks();
+        }
+
+        void UpdateOpenModeChecks()
+        {
+            if (miOpenLegacy != null) miOpenLegacy.Checked = trayOpenMode == TrayOpenMode.LegacyMixer;
+            if (miOpenSoundOutput != null) miOpenSoundOutput.Checked = trayOpenMode == TrayOpenMode.SoundOutput;
+        }
+
         void SetLanguage(AppLanguage lang)
         {
             currentLanguage = lang;
-            try 
-            { 
-                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegLangKeyPath)) 
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegKeyPath))
                 {
-                    if (k != null) k.SetValue(RegLangValue, lang == AppLanguage.Spanish ? "es" : "en", RegistryValueKind.String); 
+                    if (k != null) k.SetValue(RegLangValue, lang == AppLanguage.Spanish ? "es" : "en", RegistryValueKind.String);
                 }
-            } 
+            }
             catch { }
             ApplyLanguage();
+            UpdateOpenModeChecks();
         }
 
         void ApplyLanguage()
         {
             bool es = currentLanguage == AppLanguage.Spanish;
-            
-            // Modern and Classic shortcuts localized
-            if (miOpenMixer != null) miOpenMixer.Text = es ? "Mezclador de volumen (Moderno)" : "Volume Mixer (Modern)";
-            if (miClassicSoundPanel != null) miClassicSoundPanel.Text = es ? "Panel de sonido (Clásico)" : "Sound Panel (Classic)";
-            
+
+            if (miOpenModeRoot != null) miOpenModeRoot.Text = es ? "Abrir desde la bandeja" : "Open from tray";
+            if (miOpenLegacy != null) miOpenLegacy.Text = es ? "Mezclador de volumen heredado" : "Legacy Volume Mixer";
+            if (miOpenSoundOutput != null) miOpenSoundOutput.Text = es ? "Salida de sonido" : "Sound Output";
+
             if (miThemeRoot != null) miThemeRoot.Text = es ? "Tema del icono" : "Tray Icon Theme";
             if (miThemeAuto != null) miThemeAuto.Text = es ? "Auto (Seguir sistema)" : "Follow Windows theme (Auto)";
             if (miThemeLight != null) miThemeLight.Text = es ? "Usar icono oscuro" : "Use Dark Icon";
@@ -393,39 +447,37 @@ namespace VolMixerTray
             return 0;
         }
 
-        void TrayClick(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) Toggle(); }
-        void OpenClick(object s, EventArgs e) { OpenVolumeMixerSettings(); }
-        void ClassicSoundClick(object s, EventArgs e) { OpenClassicSoundPanel(); }
+        void TrayClick(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+
+            if (trayOpenMode == TrayOpenMode.SoundOutput)
+            {
+                OpenSoundOutput();
+                return;
+            }
+
+            ToggleLegacyMixer();
+        }
+
         void ExitClick(object s, EventArgs e) { try { tray.Visible = false; } catch { } ExitThread(); }
 
-        static void OpenVolumeMixerSettings()
+        static void OpenSoundOutput()
         {
-            try { Process.Start(new ProcessStartInfo("ms-settings:apps-volume") { UseShellExecute = true }); return; } catch { }
-            try { Process.Start(new ProcessStartInfo("ms-settings:sound") { UseShellExecute = true }); } catch { }
-        }
-
-        static void OpenClassicSoundPanel()
-        {
-            try { Process.Start(new ProcessStartInfo("control.exe", "mmsys.cpl sounds") { UseShellExecute = true }); } catch { }
-        }
-
-        void CloseSndVolGracefully()
-        {
-            // Try graceful close via PostMessage first to save user settings
-            if (sndVolHandle != IntPtr.Zero)
+            try
             {
-                PostMessage(sndVolHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-                sndVolHandle = IntPtr.Zero;
+                // Simulate Win+Ctrl+V using keybd_event so the same Windows flyout opens.
+                keybd_event(VK_LWIN, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_LCONTROL, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_V, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_V, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                keybd_event(VK_LCONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
             }
-            
-            // Backup killer for any orphaned process
-            if (sndVol != null && !sndVol.HasExited)
-            {
-                try { sndVol.CloseMainWindow(); } catch { }
-            }
+            catch { }
         }
 
-        void Toggle()
+        void ToggleLegacyMixer()
         {
             try
             {
@@ -531,6 +583,22 @@ namespace VolMixerTray
                 }
             }
             catch { }
+        }
+
+        void CloseSndVolGracefully()
+        {
+            // Try graceful close via PostMessage first to save user settings
+            if (sndVolHandle != IntPtr.Zero)
+            {
+                PostMessage(sndVolHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                sndVolHandle = IntPtr.Zero;
+            }
+
+            // Backup killer for any orphaned process
+            if (sndVol != null && !sndVol.HasExited)
+            {
+                try { sndVol.CloseMainWindow(); } catch { }
+            }
         }
 
         protected override void Dispose(bool disposing)
