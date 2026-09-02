@@ -127,45 +127,41 @@ VolumeMixer_TrayApp/
 
 # ▶ Auto-Start the Application (Optional)
 
-You can configure VolumeMixer Tray App to run automatically on Windows startup.
+VolumeMixer Tray App includes a built-in **Run at Startup** option in the tray menu.
 
-Choose one of the following options depending on whether you want auto-start for **all users** or only your **current user**.
-
----
-
-## 🟦 Auto-Start for ALL Users
-*(recommended for shared computers)*
-
-Place **either the `.exe` or a shortcut** in:
-
-```
-C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup
-```
-
-✔ Launches for **every user**  
-⚠ Requires administrator permissions
+This setting applies to the **current Windows user only** and uses the user's `Run` registry key, so **administrator permissions are not required**.
 
 ---
 
 ## 🟩 Auto-Start for Current User Only
-*(no admin rights required)*
 
-Place a shortcut in your personal Startup folder:
+Right-click the VolumeMixer Tray App icon and enable:
 
+**Run at Startup**
+
+The app stores its startup entry in:
+
+```text
+HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
 ```
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
+
+The startup value is named:
+
+```text
+VolumeMixerTray
 ```
 
-✔ Runs every time *you* log in  
-✔ No admin permissions needed
+✔ Starts automatically when **your Windows user account logs in**  
+✔ No administrator permissions required  
+✔ Can be enabled or disabled directly from the tray menu
 
 ---
 
 ### Notes
 
-- The app runs quietly in the **system tray**
-- Uses extremely low system resources
-- Compatible with **Windows 10 and Windows 11**
+- The startup option does **not** install the application or copy files to a Startup folder.
+- The executable remains portable; Windows simply launches the configured executable path at user logon.
+- The setting is stored for the **current Windows user** and does not configure startup for other users.
 
 ---
 
